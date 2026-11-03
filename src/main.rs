@@ -1,14 +1,17 @@
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use mlua::Lua;
-use ratatui::layout::{Constraint, Layout};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use mlua::{Function, Lua, RegistryKey, Table, Value};
+use ratatui::layout::Rect;
 use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tui_textarea::TextArea;
+
+type NativeRender = fn(&App, Rect, &mut Frame);
+type NativeKey = fn(&mut App, KeyEvent) -> bool;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Message {
@@ -56,20 +59,101 @@ impl Config {
     }
 }
 
-struct App {
-    textarea: TextArea<'static>,
-    history: Vec<Message>,
-    waiting: bool,
+// A component is a render spec plus an optional key handler. `render` is either
+// the name of a built-in renderer or a Lua function returning a string to draw.
+// `key` is an optional Lua function: return true to swallow a key, false to
+// fall through to the built-in handler for the renderer.
+struct Component {
+    render: Render,
+    key: Option<RegistryKey>,
 }
 
-impl App {
-    fn new() -> Self {
-        Self {
-            textarea: TextArea::default(),
-            history: Vec::new(),
-            waiting: false,
+enum Render {
+    Native(String),
+    Lua(RegistryKey),
+}
+
+struct Ui {
+    main: Component,
+    input: Component,
+    status: Option<Component>,
+}
+
+impl Default for Ui {
+    fn default() -> Self {
+        Ui {
+            main: Component {
+                render: Render::Native("transcript".into()),
+                key: None,
+            },
+            input: Component {
+                render: Render::Native("textarea".into()),
+                key: None,
+            },
+            status: Some(Component {
+                render: Render::Native("status".into()),
+                key: None,
+            }),
         }
     }
+}
+
+impl Ui {
+    fn load(lua: &Lua) -> mlua::Result<Self> {
+        let ui: Option<Table> = lua.globals().get("ui")?;
+        let Some(ui) = ui else {
+            return Ok(Ui::default());
+        };
+        Ok(Ui {
+            main: parse_component(lua, &ui, "main", "transcript")?,
+            input: parse_component(lua, &ui, "input", "textarea")?,
+            status: if ui.contains_key("status")? {
+                Some(parse_component(lua, &ui, "status", "status")?)
+            } else {
+                None
+            },
+        })
+    }
+}
+
+fn parse_component(lua: &Lua, ui: &Table, slot: &str, default: &str) -> mlua::Result<Component> {
+    let Some(spec) = ui.get::<Option<Table>>(slot)? else {
+        return Ok(Component {
+            render: Render::Native(default.into()),
+            key: None,
+        });
+    };
+    let render = match spec.get::<Value>("render")? {
+        Value::Nil => Render::Native(default.into()),
+        Value::String(s) => Render::Native(s.to_str()?.to_string()),
+        Value::Function(f) => Render::Lua(lua.create_registry_value(f)?),
+        _ => {
+            return Err(mlua::Error::RuntimeError(format!(
+                "ui.{slot}.render must be a string or function"
+            )))
+        }
+    };
+    let key = match spec.get::<Value>("key")? {
+        Value::Nil => None,
+        Value::Function(f) => Some(lua.create_registry_value(f)?),
+        _ => {
+            return Err(mlua::Error::RuntimeError(format!(
+                "ui.{slot}.key must be a function"
+            )))
+        }
+    };
+    Ok(Component { render, key })
+}
+
+struct App {
+    lua: Lua,
+    config: Config,
+    client: Client,
+    llm_tx: mpsc::UnboundedSender<Message>,
+    history: Vec<Message>,
+    waiting: bool,
+    textarea: TextArea<'static>,
+    ui: Ui,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -78,17 +162,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         lua.load(&std::fs::read_to_string("init.lua")?).exec()?;
     }
     let config = Config::load(&lua)?;
+    let ui = Ui::load(&lua)?;
     let client = Client::new();
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    rt.block_on(run(config, client))
+    rt.block_on(run(lua, config, ui, client))
 }
 
-async fn run(config: Config, client: Client) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(
+    lua: Lua,
+    config: Config,
+    ui: Ui,
+    client: Client,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = ratatui::init();
-    let mut app = App::new();
 
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
     std::thread::spawn(move || {
@@ -100,6 +189,17 @@ async fn run(config: Config, client: Client) -> Result<(), Box<dyn std::error::E
     });
 
     let (llm_tx, mut llm_rx) = mpsc::unbounded_channel();
+    let mut app = App {
+        lua,
+        config,
+        client,
+        llm_tx,
+        history: Vec::new(),
+        waiting: false,
+        textarea: TextArea::default(),
+        ui,
+    };
+
     let mut tick = tokio::time::interval(Duration::from_millis(250));
 
     loop {
@@ -107,14 +207,15 @@ async fn run(config: Config, client: Client) -> Result<(), Box<dyn std::error::E
             ev = ev_rx.recv() => {
                 let Some(ev) = ev else { break };
                 match ev {
-                    Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
-                        KeyCode::Esc => break,
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-                        KeyCode::Enter => submit(&mut app, &client, &config, &llm_tx),
-                        _ => {
-                            app.textarea.input(Event::Key(key));
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        if key.code == KeyCode::Esc { break; }
+                        if key.code == KeyCode::Char('c')
+                            && key.modifiers.contains(KeyModifiers::CONTROL)
+                        {
+                            break;
                         }
-                    },
+                        handle_key(&mut app, key);
+                    }
                     _ => {}
                 }
             }
@@ -133,7 +234,31 @@ async fn run(config: Config, client: Client) -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
-fn submit(app: &mut App, client: &Client, config: &Config, tx: &mpsc::UnboundedSender<Message>) {
+fn handle_key(app: &mut App, key: KeyEvent) -> bool {
+    // Lua key handler first (augment): true swallows, false falls through.
+    if let Some(rk) = &app.ui.input.key {
+        let s = key_to_string(key);
+        let handled = app
+            .lua
+            .registry_value::<Function>(rk)
+            .and_then(|f| f.call::<bool>(s))
+            .unwrap_or(false);
+        if handled {
+            return true;
+        }
+    }
+    // Built-in handler for the input's renderer.
+    let name = match &app.ui.input.render {
+        Render::Native(n) => n.clone(),
+        Render::Lua(_) => return false,
+    };
+    match native_key(&name) {
+        Some(h) => h(app, key),
+        None => false,
+    }
+}
+
+fn submit(app: &mut App) {
     let text = app.textarea.lines().join("\n");
     if text.trim().is_empty() || app.waiting {
         return;
@@ -146,10 +271,10 @@ fn submit(app: &mut App, client: &Client, config: &Config, tx: &mpsc::UnboundedS
     app.history.push(msg.clone());
     app.waiting = true;
 
-    let client = client.clone();
-    let config = config.clone();
+    let client = app.client.clone();
+    let config = app.config.clone();
     let history = app.history.clone();
-    let tx = tx.clone();
+    let tx = app.llm_tx.clone();
     tokio::spawn(async move {
         let reply = chat(&client, &config, &history).await;
         let _ = tx.send(reply);
@@ -196,9 +321,83 @@ fn err_msg(s: &str) -> Message {
 }
 
 fn draw(frame: &mut Frame, app: &mut App) {
-    let [hist_area, input_area] =
-        Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).areas(frame.area());
+    let area = frame.area();
+    let input_h = 3u16;
+    let status_h = if app.ui.status.is_some() { 1 } else { 0 };
+    let main_h = area.height.saturating_sub(input_h + status_h);
 
+    let main_area = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: main_h,
+    };
+    let input_y = area.y + main_h;
+    let input_area = Rect {
+        x: area.x,
+        y: input_y,
+        width: area.width,
+        height: input_h.min(area.height),
+    };
+    let status_area = Rect {
+        x: area.x,
+        y: input_y + input_h,
+        width: area.width,
+        height: status_h,
+    };
+
+    render_component(frame, app, &app.ui.main, main_area);
+    render_component(frame, app, &app.ui.input, input_area);
+    if let Some(status) = &app.ui.status {
+        render_component(frame, app, status, status_area);
+    }
+}
+
+fn render_component(frame: &mut Frame, app: &App, comp: &Component, area: Rect) {
+    match &comp.render {
+        Render::Native(name) => match native_render(name) {
+            Some(f) => f(app, area, frame),
+            None => eprintln!("unknown renderer: {name}"),
+        },
+        Render::Lua(rk) => {
+            if let Ok(f) = app.lua.registry_value::<Function>(rk) {
+                if let Ok(state) = lua_state_table(&app.lua, app) {
+                    if let Ok(Some(text)) =
+                        f.call::<Option<String>>((state, area.width, area.height))
+                    {
+                        frame.render_widget(Paragraph::new(text), area);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn lua_state_table(lua: &Lua, app: &App) -> mlua::Result<Table> {
+    let t = lua.create_table()?;
+    t.set("model", app.config.model.clone())?;
+    t.set("waiting", app.waiting)?;
+    t.set("messages", app.history.len())?;
+    Ok(t)
+}
+
+fn native_render(name: &str) -> Option<NativeRender> {
+    match name {
+        "transcript" => Some(render_transcript),
+        "textarea" => Some(render_textarea),
+        "status" => Some(render_status),
+        _ => None,
+    }
+}
+
+fn native_key(name: &str) -> Option<NativeKey> {
+    match name {
+        "textarea" => Some(key_textarea),
+        _ => None,
+    }
+}
+
+fn render_transcript(app: &App, area: Rect, frame: &mut Frame) {
     let mut text = String::new();
     for m in &app.history {
         let name = match m.role.as_str() {
@@ -212,12 +411,59 @@ fn draw(frame: &mut Frame, app: &mut App) {
     if app.waiting {
         text.push_str("\nAssistant: …");
     }
-
-    let scroll = text.lines().count().saturating_sub(hist_area.height as usize) as u16;
+    let scroll = text
+        .lines()
+        .count()
+        .saturating_sub(area.height as usize) as u16;
     let para = Paragraph::new(text).block(Block::bordered().title("llemper"));
-    frame.render_widget(para.scroll((scroll, 0)), hist_area);
+    frame.render_widget(para.scroll((scroll, 0)), area);
+}
 
-    app.textarea
-        .set_block(Block::bordered().title("Enter: send | Esc: quit"));
-    frame.render_widget(&app.textarea, input_area);
+fn render_textarea(app: &App, area: Rect, frame: &mut Frame) {
+    let mut ta = app.textarea.clone();
+    ta.set_block(Block::bordered().title("Enter: send | Esc: quit"));
+    frame.render_widget(&ta, area);
+}
+
+fn render_status(app: &App, area: Rect, frame: &mut Frame) {
+    let text = format!(
+        "{} | {} msgs{}",
+        app.config.model,
+        app.history.len(),
+        if app.waiting { " | …" } else { "" }
+    );
+    frame.render_widget(Paragraph::new(text), area);
+}
+
+fn key_textarea(app: &mut App, key: KeyEvent) -> bool {
+    if key.code == KeyCode::Enter {
+        submit(app);
+        return true;
+    }
+    app.textarea.input(Event::Key(key));
+    true
+}
+
+fn key_to_string(key: KeyEvent) -> String {
+    let mut s = String::new();
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        s.push_str("ctrl-");
+    }
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        s.push_str("alt-");
+    }
+    match key.code {
+        KeyCode::Enter => s.push_str("enter"),
+        KeyCode::Esc => s.push_str("esc"),
+        KeyCode::Backspace => s.push_str("backspace"),
+        KeyCode::Tab => s.push_str("tab"),
+        KeyCode::Up => s.push_str("up"),
+        KeyCode::Down => s.push_str("down"),
+        KeyCode::Left => s.push_str("left"),
+        KeyCode::Right => s.push_str("right"),
+        KeyCode::Char(c) => s.push(c),
+        KeyCode::F(n) => s.push_str(&format!("f{n}")),
+        other => s.push_str(&format!("{other:?}")),
+    }
+    s
 }
